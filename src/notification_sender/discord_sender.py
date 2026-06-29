@@ -6,6 +6,7 @@ Discord 发送提醒服务
 1. 通过 webhook 或 Discord bot API 发送 Discord 消息
 """
 import logging
+import time
 from typing import Optional
 
 import requests
@@ -66,7 +67,13 @@ class DiscordSender:
 
         # 优先使用 Webhook（配置简单，权限低）
         if self._discord_config['webhook_url']:
-            return all(self._send_discord_webhook(chunk, timeout_seconds=timeout_seconds) for chunk in chunks)
+            ok = True
+            for i, chunk in enumerate(chunks):
+                if i > 0:
+                    time.sleep(0.7)  # 节流，规避 Discord webhook 速率限制（长报告分多块）
+                if not self._send_discord_webhook(chunk, timeout_seconds=timeout_seconds):
+                    ok = False
+            return ok
 
         # 其次使用 Bot API（权限高，需要 channel_id）
         if self._discord_config['bot_token'] and self._discord_config['channel_id']:
@@ -95,19 +102,34 @@ class DiscordSender:
                 'avatar_url': 'https://picsum.photos/200'
             }
             
-            response = requests.post(
-                self._discord_config['webhook_url'],
-                json=payload,
-                timeout=timeout_seconds or 10,
-                verify=self._webhook_verify_ssl
-            )
-            
-            if response.status_code in [200, 204]:
-                logger.info("Discord Webhook 消息发送成功")
-                return True
-            else:
+            for attempt in range(5):
+                response = requests.post(
+                    self._discord_config['webhook_url'],
+                    json=payload,
+                    timeout=timeout_seconds or 10,
+                    verify=self._webhook_verify_ssl
+                )
+
+                if response.status_code in [200, 204]:
+                    logger.info("Discord Webhook 消息发送成功")
+                    return True
+
+                # 429 限流：按 Discord 返回的 retry_after 等待后重试
+                if response.status_code == 429:
+                    retry_after = 1.0
+                    try:
+                        retry_after = float(response.json().get('retry_after', 1.0))
+                    except Exception:
+                        pass
+                    logger.warning(f"Discord Webhook 被限流，{retry_after}s 后重试（第 {attempt + 1} 次）")
+                    time.sleep(retry_after + 0.3)
+                    continue
+
                 logger.error(f"Discord Webhook 发送失败: {response.status_code} {response.text}")
                 return False
+
+            logger.error("Discord Webhook 发送失败: 多次限流后仍未成功")
+            return False
         except Exception as e:
             logger.error(f"Discord Webhook 发送异常: {e}")
             return False
