@@ -5,6 +5,7 @@ Discord 发送提醒服务
 职责：
 1. 通过 webhook 或 Discord bot API 发送 Discord 消息
 """
+import json
 import logging
 import time
 from typing import Optional
@@ -34,6 +35,8 @@ class DiscordSender:
         }
         self._discord_max_words = getattr(config, 'discord_max_words', 2000)
         self._webhook_verify_ssl = getattr(config, 'webhook_verify_ssl', True)
+        # 超过该块数则改为「摘要内嵌 + 完整报告附件」，避免长报告刷屏
+        self._discord_inline_chunk_limit = getattr(config, 'discord_inline_chunk_limit', 3)
     
     def _is_discord_configured(self) -> bool:
         """检查 Discord 配置是否完整（支持 Bot 或 Webhook）"""
@@ -67,6 +70,11 @@ class DiscordSender:
 
         # 优先使用 Webhook（配置简单，权限低）
         if self._discord_config['webhook_url']:
+            # 长报告：摘要内嵌 + 完整报告作为 .md 附件，避免在频道里刷屏
+            if len(chunks) > self._discord_inline_chunk_limit:
+                return self._send_discord_webhook_file(
+                    chunks[0], content, "report.md", timeout_seconds=timeout_seconds
+                )
             ok = True
             for i, chunk in enumerate(chunks):
                 if i > 0:
@@ -133,7 +141,66 @@ class DiscordSender:
         except Exception as e:
             logger.error(f"Discord Webhook 发送异常: {e}")
             return False
-    
+
+    def _send_discord_webhook_file(
+        self, summary: str, file_text: str, filename: str,
+        *, timeout_seconds: Optional[float] = None
+    ) -> bool:
+        """
+        长报告投递：内嵌一段摘要 + 完整报告作为附件上传，避免在频道里刷屏。
+
+        Args:
+            summary: 内嵌正文（如记分板摘要），≤2000 字符
+            file_text: 完整报告全文，作为 report.md 附件
+            filename: 附件文件名
+
+        Returns:
+            是否发送成功
+        """
+        try:
+            if summary and len(summary) > 1900:
+                summary = summary[:1900] + "\n…（完整决策卡见附件 report.md）"
+            payload_json = json.dumps({
+                'content': summary or '📊 A股决策仪表盘（完整内容见附件）',
+                'username': 'A股分析机器人',
+                'avatar_url': 'https://picsum.photos/200',
+            })
+
+            for attempt in range(5):
+                files = {
+                    'payload_json': (None, payload_json, 'application/json'),
+                    'files[0]': (filename, file_text.encode('utf-8'), 'text/markdown'),
+                }
+                response = requests.post(
+                    self._discord_config['webhook_url'],
+                    files=files,
+                    timeout=timeout_seconds or 30,
+                    verify=self._webhook_verify_ssl
+                )
+
+                if response.status_code in [200, 204]:
+                    logger.info("Discord Webhook 报告(摘要+附件)发送成功")
+                    return True
+
+                if response.status_code == 429:
+                    retry_after = 1.0
+                    try:
+                        retry_after = float(response.json().get('retry_after', 1.0))
+                    except Exception:
+                        pass
+                    logger.warning(f"Discord Webhook(附件) 被限流，{retry_after}s 后重试（第 {attempt + 1} 次）")
+                    time.sleep(retry_after + 0.3)
+                    continue
+
+                logger.error(f"Discord Webhook(附件) 发送失败: {response.status_code} {response.text}")
+                return False
+
+            logger.error("Discord Webhook(附件) 发送失败: 多次限流后仍未成功")
+            return False
+        except Exception as e:
+            logger.error(f"Discord Webhook(附件) 发送异常: {e}")
+            return False
+
     def _send_discord_bot(self, content: str, *, timeout_seconds: Optional[float] = None) -> bool:
         """
         使用 Bot API 发送消息到 Discord
